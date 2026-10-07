@@ -23,8 +23,9 @@ export interface CommandSpec {
   inputOptions?: string[];
 }
 
-export function defaultShell(platform: NodeJS.Platform = process.platform): Shell {
-  return platform === 'win32' ? 'powershell' : 'posix';
+export function defaultShell(platform?: string): Shell {
+  const p = platform ?? (typeof process !== 'undefined' ? process.platform : '');
+  return p === 'win32' ? 'powershell' : 'posix';
 }
 
 const SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
