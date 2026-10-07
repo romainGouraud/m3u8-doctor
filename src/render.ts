@@ -32,7 +32,13 @@ function renditionLabel(r: Rendition): string {
   return r.name || r.language || r.groupId;
 }
 
-export function render(report: Report, opts: RenderOptions): string {
+/** Removes C0/C1 control characters (ANSI escapes, CR...) from remote text before it reaches a terminal. */
+function clean<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value), (_k, v: unknown) => (typeof v === 'string' ? v.replace(/[\u0000-\u001f\u007f-\u009f]/g, '') : v)) as T;
+}
+
+export function render(input: Report, opts: RenderOptions): string {
+  const report = clean(input);
   const c = paint(opts.color);
   const lines: string[] = [];
   const label = (k: string) => c.dim(k.padEnd(9));
@@ -70,7 +76,7 @@ export function render(report: Report, opts: RenderOptions): string {
     lines.push('', c.bold('Variants'));
     const sorted = [...report.master.variants].sort((a, b) => (b.resolution?.height ?? 0) - (a.resolution?.height ?? 0) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0));
     for (const v of sorted.slice(0, 12)) {
-      const mark = v === report.selected?.variant ? c.green('›') : ' ';
+      const mark = report.selected?.variant && v.uri === report.selected.variant.uri ? c.green('›') : ' ';
       lines.push(` ${mark} ${variantLine(v)}`);
     }
     if (sorted.length > 12) lines.push(c.dim(`   ... ${sorted.length - 12} more`));

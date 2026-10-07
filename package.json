@@ -2,7 +2,7 @@
   "name": "m3u8-doctor",
   "version": "0.1.0",
   "description": "Explain any HLS (.m3u8) stream in plain words: separate audio, encryption, DRM, live vs VOD, and the exact ffmpeg command that keeps the sound.",
-  "keywords": ["m3u8", "hls", "ffmpeg", "video", "streaming", "cli", "aes-128", "playlist", "no-audio", "downloader"],
+  "keywords": ["m3u8", "hls", "ffmpeg", "video", "streaming", "cli", "aes-128", "playlist", "no-audio", "diagnostic", "debug"],
   "license": "MIT",
   "author": "Romain Gouraud (https://getvidora.com)",
   "homepage": "https://github.com/romainGouraud/m3u8-doctor#readme",
@@ -14,7 +14,7 @@
   "types": "./dist/index.d.ts",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
-  "engines": { "node": ">=18.17" },
+  "engines": { "node": ">=20" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

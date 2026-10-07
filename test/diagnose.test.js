@@ -54,6 +54,31 @@ before(async () => {
     // disguised segments + discontinuity + HEVC
     '/odd/v.m3u8': { body: '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\na.jpg\n#EXT-X-DISCONTINUITY\n#EXTINF:6,\na.jpg\n#EXT-X-ENDLIST\n' },
     '/odd/a.jpg': { body: makeTs([0x24, 0x0f]), type: 'image/jpeg' },
+    // RFC 8216: DEFAULT rendition without URI is muxed into the variant
+    '/muxdef/master.m3u8': {
+      body: '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Main",DEFAULT=YES,AUTOSELECT=YES\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Commentary",DEFAULT=NO,URI="alt.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="a"\nv.m3u8\n',
+    },
+    '/muxdef/v.m3u8': { body: media('s.ts') },
+    '/muxdef/s.ts': { body: makeTs([0x1b, 0x0f]) },
+    // audio-only master with a separate audio rendition
+    '/radio/master.m3u8': { body: '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Radio",DEFAULT=YES,URI="a.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2",AUDIO="a"\na.m3u8\n' },
+    '/radio/a.m3u8': { body: media('a.aac') },
+    '/radio/a.aac': { body: Buffer.from([0xff, 0xf1, 0x50, 0x80, 0, 0, 0]), type: 'audio/aac' },
+    // clear pre-roll, then AES-128 segments
+    '/preroll/v.m3u8': { body: '#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nclear.ts\n#EXT-X-KEY:METHOD=AES-128,URI="key"\n#EXTINF:6,\nenc.ts\n#EXT-X-ENDLIST\n' },
+    '/preroll/clear.ts': { body: makeTs([0x1b, 0x0f]) },
+    '/preroll/key': { body: KEY },
+    // key server down (network error)
+    '/keydown/v.m3u8': { body: media('s.ts', '#EXT-X-KEY:METHOD=AES-128,URI="http://127.0.0.1:1/key"\n') },
+    // CENC fMP4 with Widevine pssh and no HLS key
+    '/cenc/v.m3u8': { body: media('s.m4s', '#EXT-X-MAP:URI="init.mp4"\n') },
+    '/cenc/init.mp4': { body: makeInit([{ handler: 'vide', entry: 'avc1', encrypted: true, scheme: 'cenc' }], { pssh: ['edef8ba9-79d6-4ace-a3c8-27dcd51d21ed'] }) },
+    // terminal escape injection in rendition names
+    '/ansi/master.m3u8': { body: '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="\u001b]0;PWNED\u0007\u001b[2JEVIL",DEFAULT=YES,URI="a.m3u8"\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1.4d401f,mp4a.40.2",AUDIO="a"\nv.m3u8\n' },
+    '/ansi/v.m3u8': { body: media('s.ts') },
+    '/ansi/a.m3u8': { body: media('a.aac') },
+    '/ansi/s.ts': { body: makeTs([0x1b]) },
+    '/ansi/a.aac': { body: Buffer.from([0xff, 0xf1, 0x50, 0x80]) },
     // server ignoring Range must still be probed (body capped)
     '/norange/v.m3u8': { body: media('s.ts') },
     '/norange/s.ts': { body: makeTs([0x1b, 0x0f], { size: 188 * 4000 }), ignoreRange: true },
@@ -106,10 +131,54 @@ test('FairPlay DRM: no command, no segment request', async () => {
   assert.deepEqual(srv.requests.slice(before).map((q) => q.url), ['/drm/v.m3u8']);
 });
 
-test('live playlist is flagged', async () => {
-  const r = await diagnose(`${srv.url}/live/v.m3u8`);
+test('live playlist is flagged and recorded to .ts', async () => {
+  const r = await diagnose(`${srv.url}/live/v.m3u8`, { shell: 'posix' });
   assert.equal(r.video.type, 'live');
   assert.ok(codes(r).includes('LIVE'));
+  assert.match(r.command, /\.ts$/);
+});
+
+test('regression: muxed DEFAULT rendition is not replaced by the alternate track', async () => {
+  const r = await diagnose(`${srv.url}/muxdef/master.m3u8`, { shell: 'posix' });
+  assert.equal(r.selected.audio, null);
+  assert.ok(!codes(r).includes('SEPARATE_AUDIO'));
+  assert.equal(r.command, `ffmpeg -i ${srv.url}/muxdef/v.m3u8 -c copy muxdef.mp4`);
+});
+
+test('regression: audio-only master gives a single-input audio command', async () => {
+  const r = await diagnose(`${srv.url}/radio/master.m3u8`, { shell: 'posix' });
+  assert.ok(!codes(r).includes('SEPARATE_AUDIO'));
+  assert.ok(codes(r).includes('AUDIO_ONLY'));
+  assert.equal(r.command, `ffmpeg -i ${srv.url}/radio/a.m3u8 -map 0:a:0 -c copy radio.m4a`);
+});
+
+test('regression: clear first segment before AES-128 is not decrypted', async () => {
+  const r = await diagnose(`${srv.url}/preroll/v.m3u8`);
+  assert.deepEqual(r.video.probe.tracks.map((t) => t.codec), ['h264', 'aac']);
+  assert.ok(codes(r).includes('AES_128'));
+});
+
+test('regression: unreachable key server is never reported as reachable', async () => {
+  const r = await diagnose(`${srv.url}/keydown/v.m3u8`, { timeoutMs: 2000 });
+  assert.ok(codes(r).includes('AES_KEY_UNCHECKED'));
+  assert.ok(!codes(r).includes('AES_128'));
+});
+
+test('regression: CENC init segment with Widevine pssh is DRM', async () => {
+  const r = await diagnose(`${srv.url}/cenc/v.m3u8`);
+  assert.ok(codes(r).includes('DRM'));
+  assert.equal(r.command, null);
+});
+
+test('regression: ANSI escapes from the playlist never reach the terminal', async () => {
+  const out = (await run('node', [CLI, `${srv.url}/ansi/master.m3u8`, '--no-color'])).stdout;
+  assert.ok(!out.includes('\u001b'));
+  assert.match(out, /EVIL/);
+});
+
+test('regression: -H "User-Agent: x" is carried into the command', async () => {
+  const out = (await run('node', [CLI, `${srv.url}/muxed/master.m3u8`, '-H', 'User-Agent: MyAgent/1', '--shell', 'posix', '--no-color'])).stdout;
+  assert.match(out, /ffmpeg -user_agent MyAgent\/1 -i /);
 });
 
 test('403 to non-browsers: retried as a browser, UA carried into the command', async () => {
@@ -147,9 +216,10 @@ test('server ignoring Range: probe reads a bounded prefix only', async () => {
   assert.deepEqual(r.video.probe.tracks.map((t) => t.codec), ['h264', 'aac']);
 });
 
-test('expired signed URL is reported even when the server still answers', async () => {
+test('expired signed URL is a warning, not a blocker, when the server still answers', async () => {
   const r = await diagnose(`${srv.url}/muxed/master.m3u8?Expires=1500000000`);
-  assert.ok(codes(r).includes('SIGNED_URL_EXPIRED'));
+  assert.equal(r.findings.find((f) => f.code === 'SIGNED_URL_EXPIRED').severity, 'warn');
+  assert.ok(r.command);
 });
 
 test('--no-probe skips segment requests', async () => {

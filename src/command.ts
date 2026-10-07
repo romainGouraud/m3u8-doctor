@@ -2,7 +2,8 @@
  * Builds a copy-paste ffmpeg command, quoted for the target shell.
  */
 
-export type Shell = 'posix' | 'powershell' | 'cmd';
+/** posix = bash/zsh (the -headers value uses $'...' quoting). cmd.exe is not supported: it cannot quote % or CRLF. */
+export type Shell = 'posix' | 'powershell';
 
 export interface CommandInput {
   url: string;
@@ -34,10 +35,8 @@ export function quote(value: string, shell: Shell): string {
     case 'posix':
       return `'${value.replace(/'/g, `'\\''`)}'`;
     case 'powershell':
-      return `'${value.replace(/'/g, "''")}'`;
-    case 'cmd':
-      // cmd.exe has no reliable escape for % inside quotes; double it for interactive use.
-      return `"${value.replace(/"/g, '""').replace(/%/g, '%%')}"`;
+      // PowerShell also treats the Unicode single quotes as quote characters.
+      return `'${value.replace(/['\u2018\u2019\u201a\u201b]/g, (q) => q + q)}'`;
   }
 }
 
@@ -48,12 +47,8 @@ function quoteHeaders(headers: Record<string, string>, shell: Shell): string {
     const body = lines.map((l) => l.replace(/\\/g, '\\\\').replace(/'/g, "\\'")).join('\\r\\n') + '\\r\\n';
     return `$'${body}'`;
   }
-  if (shell === 'powershell') {
-    const body = lines.map((l) => l.replace(/[`"$]/g, (c) => '`' + c)).join('`r`n') + '`r`n';
-    return `"${body}"`;
-  }
-  // cmd.exe cannot express CRLF inside an argument; ffmpeg appends the final CRLF itself.
-  return quote(lines.join(' '), shell);
+  const body = lines.map((l) => l.replace(/[`"$\u201c\u201d\u201e]/g, (c) => '`' + c)).join('`r`n') + '`r`n';
+  return `"${body}"`;
 }
 
 export function buildFfmpegCommand(spec: CommandSpec, shell: Shell): string {

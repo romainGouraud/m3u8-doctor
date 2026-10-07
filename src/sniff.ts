@@ -91,7 +91,7 @@ function privateStreamTrack(descriptors: { tag: number; data: Uint8Array }[]): S
     if (tag === 0x59) return { type: 'text', codec: 'dvb-subtitles' };
     if (tag === 0x56) return { type: 'text', codec: 'teletext' };
     if (tag === 0x05 && data.length >= 4) {
-      const id = String.fromCharCode(data[0]!, data[1]!, data[2]!, data[3]!);
+      const id = fourcc(data, 0);
       if (id === 'Opus') return { type: 'audio', codec: 'opus' };
       if (id === 'AC-3') return { type: 'audio', codec: 'ac-3' };
       if (id === 'EAC3') return { type: 'audio', codec: 'ec-3' };
@@ -131,7 +131,7 @@ export function sniffTs(b: Uint8Array): SniffedTrack[] | null {
         const esInfoLength = ((s[i + 3]! & 0x0f) << 8) | s[i + 4]!;
         const descriptors = readDescriptors(s.subarray(i + 5, i + 5 + esInfoLength));
         const known = TS_STREAM_TYPES[streamType];
-        tracks.push(known ? { ...known } : streamType === 0x06 ? privateStreamTrack(descriptors) : { type: 'data', codec: `0x${streamType.toString(16)}` });
+        tracks.push(known ? { ...known } : streamType === 0x06 ? privateStreamTrack(descriptors) : { type: 'data', codec: `stream type 0x${streamType.toString(16)}` });
         i += 5 + esInfoLength;
       }
       return tracks;
@@ -144,8 +144,14 @@ const MP4_CONTAINERS = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl', 'edts', 
 const VISUAL_ENTRY_HEADER = 78;
 const AUDIO_ENTRY_HEADER = 28;
 
+/** Box type as text; non-printable bytes become '?' so they never reach a terminal. */
 function fourcc(b: Uint8Array, o: number): string {
-  return String.fromCharCode(b[o]!, b[o + 1]!, b[o + 2]!, b[o + 3]!);
+  let out = '';
+  for (let i = 0; i < 4; i++) {
+    const c = b[o + i] ?? 0;
+    out += c >= 0x20 && c < 0x7f ? String.fromCharCode(c) : '?';
+  }
+  return out;
 }
 
 function u32(b: Uint8Array, o: number): number {
@@ -201,8 +207,10 @@ export function sniffMp4(b: Uint8Array): Omit<SniffResult, 'container'> | null {
   const pssh = new Set<string>();
   let scheme: string | null = null;
 
-  const walk = (start: number, end: number, handler: string | null): string | null => {
+  const MAX_DEPTH = 16;
+  const walk = (start: number, end: number, handler: string | null, depth: number): string | null => {
     let currentHandler = handler;
+    if (depth > MAX_DEPTH) return currentHandler;
     for (const box of boxes(b, start, end)) {
       if (box.type === 'pssh' && box.body + 20 <= box.end) pssh.add(hexId(b, box.body + 4));
       if (box.type === 'hdlr' && box.body + 12 <= box.end) currentHandler = fourcc(b, box.body + 8);
@@ -228,13 +236,13 @@ export function sniffMp4(b: Uint8Array): Omit<SniffResult, 'container'> | null {
         }
       }
       if (MP4_CONTAINERS.has(box.type)) {
-        const inner = walk(box.body, box.end, box.type === 'trak' ? null : currentHandler);
+        const inner = walk(box.body, box.end, box.type === 'trak' ? null : currentHandler, depth + 1);
         if (box.type !== 'trak') currentHandler = inner;
       }
     }
     return currentHandler;
   };
-  walk(0, b.length, null);
+  walk(0, b.length, null, 0);
   return { tracks, psshSystems: [...pssh], scheme };
 }
 

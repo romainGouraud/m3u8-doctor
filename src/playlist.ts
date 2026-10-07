@@ -6,16 +6,36 @@
 
 export type Attrs = Record<string, string>;
 
-/** Parses an attribute list: KEY=value,KEY="quoted, value",... */
+/**
+ * Parses an attribute list: KEY=value,KEY="quoted, value",...
+ * Linear single pass (no regex backtracking on hostile input).
+ */
 export function parseAttributes(input: string): Attrs {
   const out: Attrs = {};
-  const re = /([A-Z0-9-]+)\s*=\s*("[^"]*"|[^,]*)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(input)) !== null) {
-    const key = m[1]!.toUpperCase();
-    let value = m[2]!.trim();
-    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) value = value.slice(1, -1);
-    out[key] = value;
+  const n = input.length;
+  let i = 0;
+  while (i < n) {
+    while (i < n && (input[i] === ',' || input[i] === ' ' || input[i] === '\t')) i++;
+    const keyStart = i;
+    while (i < n && input[i] !== '=' && input[i] !== ',') i++;
+    const key = input.slice(keyStart, i).trim().toUpperCase();
+    if (i >= n || input[i] === ',') continue; // key without value: skip
+    i++; // '='
+    while (i < n && input[i] === ' ') i++;
+    let value: string;
+    if (input[i] === '"') {
+      const close = input.indexOf('"', i + 1);
+      const end = close === -1 ? n : close;
+      value = input.slice(i + 1, end);
+      i = end + 1;
+      while (i < n && input[i] !== ',') i++;
+    } else {
+      const comma = input.indexOf(',', i);
+      const end = comma === -1 ? n : comma;
+      value = input.slice(i, end).trim();
+      i = end;
+    }
+    if (/^[A-Z0-9-]+$/.test(key)) out[key] = value;
   }
   return out;
 }
@@ -66,7 +86,8 @@ export interface Segment {
   sequence: number;
   key: KeyTag | null;
   byteRange: ByteRange | null;
-  map: { uri: string; byteRange: ByteRange | null } | null;
+  /** Init segment; `key` is the EXT-X-KEY in effect when EXT-X-MAP appeared (RFC 8216 4.3.2.5). */
+  map: { uri: string; byteRange: ByteRange | null; key: KeyTag | null } | null;
   discontinuity: boolean;
 }
 
@@ -142,7 +163,7 @@ function toKey(attrs: Attrs, base: string | null): KeyTag {
 
 /** Throws PlaylistError with a useful code when the body is not an m3u8. */
 export function assertM3u8(text: string): void {
-  const head = text.replace(/^﻿/, '').trimStart().slice(0, 512);
+  const head = text.replace(/^\uFEFF/, '').trimStart().slice(0, 512);
   if (head.startsWith('#EXTM3U')) return;
   if (head === '') throw new PlaylistError('The response body is empty.', 'EMPTY');
   if (/^<\?xml[\s\S]*<MPD|^<MPD/i.test(head) || /<MPD[\s>]/i.test(text.slice(0, 4096))) {
@@ -156,7 +177,7 @@ export function assertM3u8(text: string): void {
 
 export function parsePlaylist(text: string, baseUrl: string | null): Playlist {
   assertM3u8(text);
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/).map((l) => l.trim());
+  const lines = text.replace(/^\uFEFF/, '').split(/\r\n|\r|\n/).map((l) => l.trim());
 
   const variants: Variant[] = [];
   const renditions: Rendition[] = [];
@@ -268,7 +289,7 @@ export function parsePlaylist(text: string, baseUrl: string | null): Playlist {
         targetDuration = num(value);
         break;
       case '#EXT-X-MEDIA-SEQUENCE':
-        mediaSequence = num(value) ?? 0;
+        mediaSequence = Math.max(0, Math.floor(num(value) ?? 0));
         break;
       case '#EXT-X-PLAYLIST-TYPE': {
         const t = value.trim().toUpperCase();
@@ -302,7 +323,7 @@ export function parsePlaylist(text: string, baseUrl: string | null): Playlist {
       case '#EXT-X-MAP': {
         const a = parseAttributes(value);
         currentMap = a.URI !== undefined
-          ? { uri: resolveUri(a.URI, baseUrl), byteRange: a.BYTERANGE ? parseByteRange(a.BYTERANGE) : null }
+          ? { uri: resolveUri(a.URI, baseUrl), byteRange: a.BYTERANGE ? parseByteRange(a.BYTERANGE) : null, key: currentKey }
           : null;
         break;
       }

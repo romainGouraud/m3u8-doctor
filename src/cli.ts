@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { diagnose, type DiagnoseOptions } from './diagnose.js';
+import { isValidHeader } from './http.js';
 import type { Shell } from './command.js';
 import { render } from './render.js';
 
@@ -18,10 +19,10 @@ Options
   -r, --referer <url>         Send this Referer (the page that plays the video)
   -A, --user-agent <ua>       Send this User-Agent
       --max-height <px>       Pick the best variant at or below this height (e.g. 720)
-      --no-probe              Do not download the first bytes of a segment
-      --base <url>            Base URL for relative URIs when reading a local file
+      --no-probe              Do not fetch segment bytes (playlists and AES keys still are)
+      --base <url>            For a saved .m3u8 file: the URL it was downloaded from
   -o, --output <file>         Output file name used in the command
-      --shell <posix|powershell|cmd>  Quote the command for this shell
+      --shell <posix|powershell>  Quote the command for bash/zsh or PowerShell
       --timeout <seconds>     Network timeout per request (default 15)
       --json                  Print the full report as JSON
       --no-color              Disable colors (NO_COLOR is honored too)
@@ -30,9 +31,9 @@ Options
   -h, --help                  Print this help
 
 Exit codes
-  0  ready to download
-  1  a problem was found (silent stream, expired URL, network, not HLS...)
-  2  DRM protected, cannot be downloaded
+  0  no blocking problem (warnings may remain)
+  1  blocking problem (silent stream, forbidden URL or key, not HLS, network) or usage error
+  2  DRM protected
 
 Examples
   npx m3u8-doctor "https://example.com/video/master.m3u8"
@@ -47,7 +48,10 @@ function fail(message: string): never {
 function parseHeader(raw: string): [string, string] {
   const i = raw.indexOf(':');
   if (i <= 0) fail(`invalid header "${raw}", expected "Name: value"`);
-  return [raw.slice(0, i).trim(), raw.slice(i + 1).trim()];
+  const name = raw.slice(0, i).trim();
+  const value = raw.slice(i + 1).trim();
+  if (!isValidHeader(name, value)) fail(`invalid header "${name}": no line breaks or control characters allowed`);
+  return [name, value];
 }
 
 async function main(): Promise<void> {
@@ -85,9 +89,11 @@ async function main(): Promise<void> {
     return;
   }
   const headers: Record<string, string> = {};
+  let headerUA: string | undefined;
   for (const h of values.header ?? []) {
     const [k, v] = parseHeader(h);
-    headers[k] = v;
+    if (k.toLowerCase() === 'user-agent') headerUA = v;
+    else headers[k] = v;
   }
   const input = positionals[0];
   if (!input) {
@@ -99,7 +105,8 @@ async function main(): Promise<void> {
   if (values.referer) headers.Referer = values.referer;
 
   const opts: DiagnoseOptions = { headers, probe: !values['no-probe'] };
-  if (values['user-agent']) opts.userAgent = values['user-agent'];
+  const ua = values['user-agent'] ?? headerUA;
+  if (ua) opts.userAgent = ua;
   if (values['max-height']) {
     const h = Number(values['max-height']);
     if (!Number.isInteger(h) || h <= 0) fail('--max-height expects a positive integer');
@@ -108,7 +115,7 @@ async function main(): Promise<void> {
   if (values.base) opts.baseUrl = values.base;
   if (values.output) opts.output = values.output;
   if (values.shell) {
-    if (!['posix', 'powershell', 'cmd'].includes(values.shell)) fail('--shell expects posix, powershell or cmd');
+    if (!['posix', 'powershell'].includes(values.shell)) fail('--shell expects posix (bash, zsh) or powershell');
     opts.shell = values.shell as Shell;
   }
   if (values.timeout) {

@@ -1,12 +1,13 @@
 /**
  * The diagnosis pipeline: load -> parse -> pick variant -> inspect media
  * playlists -> probe the first segment -> findings -> ffmpeg command.
+ * Runs in Node >= 20 and in browsers (WebCrypto, fetch, no node:* at top level).
  */
-import { createDecipheriv } from 'node:crypto';
-import { codecKind, codecName, classifyEncryption, signedUrlExpiry, type Encryption } from './classify.js';
+import { aes128CbcDecryptPrefix, hlsIv } from './aes.js';
+import { codecKind, codecName, classifyEncryption, psshSystem, signedUrlExpiry, type DrmSystem, type Encryption } from './classify.js';
 import { buildFfmpegCommand, defaultShell, outputName, type CommandInput, type Shell } from './command.js';
-import { BROWSER_UA, FetchError, get, isHttpUrl, loadText, type RequestContext } from './http.js';
-import { parsePlaylist, PlaylistError, type MasterPlaylist, type MediaPlaylist, type Rendition, type Segment, type Variant } from './playlist.js';
+import { BROWSER_UA, FetchError, get, isHttpUrl, loadText, type LoadedText, type RequestContext } from './http.js';
+import { parsePlaylist, PlaylistError, type KeyTag, type MasterPlaylist, type MediaPlaylist, type Playlist, type Rendition, type Segment, type Variant } from './playlist.js';
 import { sniff, type SniffResult, type SniffedTrack } from './sniff.js';
 
 export const GUIDES = {
@@ -40,8 +41,11 @@ export interface DiagnoseOptions {
   timeoutMs?: number;
   shell?: Shell;
   output?: string;
+  /** Clock used for signed-URL expiry (tests). */
   now?: Date;
 }
+
+export type Container = 'mpegts' | 'fmp4' | 'packed-audio' | 'unknown';
 
 export interface MediaReport {
   url: string;
@@ -49,14 +53,14 @@ export interface MediaReport {
   durationSec: number;
   segments: number;
   targetDuration: number | null;
-  container: 'mpegts' | 'fmp4' | 'packed-audio' | 'unknown';
+  container: Container;
   encryption: Encryption;
-  key: { url: string; status: number | null; validLength: boolean | null } | null;
+  key: { url: string; status: number | null; validLength: boolean | null; error: string | null } | null;
   byteRanges: boolean;
   discontinuities: number;
   lowLatency: boolean;
   segmentExtensions: string[];
-  probe: { tracks: SniffedTrack[]; note: string | null } | null;
+  probe: { tracks: SniffedTrack[]; drm: DrmSystem[]; note: string | null } | null;
 }
 
 export interface Report {
@@ -80,11 +84,13 @@ export interface Report {
 }
 
 const PROBE_BYTES = 256 * 1024;
-const NORMAL_SEGMENT_EXT = new Set(['ts', 'm4s', 'mp4', 'm4v', 'm4a', 'aac', 'mp3', 'ac3', 'ec3', 'cmfv', 'cmfa', 'mpegts', 'mpg', 'vtt', 'webvtt']);
+const INIT_BYTES = 2 * 1024 * 1024;
+/** Extensions that are never media: the classic disguise of pirate CDNs. */
+const DISGUISE_EXT = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'ico', 'svg', 'html', 'htm', 'js', 'css', 'txt', 'json', 'php', 'xml']);
 
-function hasAudioCodec(v: Variant): boolean | null {
+function hasCodec(v: Variant, kind: 'video' | 'audio'): boolean | null {
   if (v.codecs.length === 0) return null;
-  return v.codecs.some((c) => codecKind(c) === 'audio');
+  return v.codecs.some((c) => codecKind(c) === kind);
 }
 
 function height(v: Variant): number {
@@ -92,8 +98,8 @@ function height(v: Variant): number {
 }
 
 export function pickVariant(variants: Variant[], maxHeight?: number): Variant | null {
-  const playable = variants.filter((v) => !v.codecs.length || v.codecs.some((c) => codecKind(c) === 'video'));
-  const pool = playable.length > 0 ? playable : variants;
+  const withVideo = variants.filter((v) => hasCodec(v, 'video') !== false);
+  const pool = withVideo.length > 0 ? withVideo : variants;
   const capped = maxHeight ? pool.filter((v) => height(v) === 0 || height(v) <= maxHeight) : pool;
   const candidates = capped.length > 0 ? capped : pool;
   // Same height: prefer AAC audio (plays everywhere once in MP4), then the higher bitrate.
@@ -101,10 +107,17 @@ export function pickVariant(variants: Variant[], maxHeight?: number): Variant | 
   return [...candidates].sort((a, b) => height(b) - height(a) || aacScore(b) - aacScore(a) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0))[0] ?? null;
 }
 
+/**
+ * The audio rendition a player would use with this variant, or null when that
+ * audio is muxed into the variant itself (RFC 8216 4.3.4.1: no URI = in the variant).
+ */
 export function pickAudio(master: MasterPlaylist, variant: Variant | null): Rendition | null {
   if (!variant?.audioGroup) return null;
   const group = master.renditions.filter((r) => r.type === 'AUDIO' && r.groupId === variant.audioGroup);
-  return group.find((r) => r.isDefault && r.uri) ?? group.find((r) => r.autoselect && r.uri) ?? group.find((r) => r.uri) ?? null;
+  if (group.length === 0) return null;
+  const preferred = group.find((r) => r.isDefault) ?? group.find((r) => r.autoselect) ?? group[0]!;
+  if (!preferred.uri) return null;
+  return preferred;
 }
 
 function mediaType(m: MediaPlaylist): MediaReport['type'] {
@@ -115,8 +128,7 @@ function mediaType(m: MediaPlaylist): MediaReport['type'] {
 
 function extOf(uri: string): string {
   try {
-    const p = new URL(uri).pathname;
-    const m = /\.([A-Za-z0-9]{1,6})$/.exec(p);
+    const m = /\.([A-Za-z0-9]{1,6})$/.exec(new URL(uri).pathname);
     return m ? m[1]!.toLowerCase() : '';
   } catch {
     const m = /\.([A-Za-z0-9]{1,6})(?:\?|$)/.exec(uri);
@@ -124,126 +136,139 @@ function extOf(uri: string): string {
   }
 }
 
-function guessContainer(m: MediaPlaylist): MediaReport['container'] {
+function guessContainer(m: MediaPlaylist): Container {
   const first = m.segments[0];
   if (!first) return 'unknown';
   if (first.map) return 'fmp4';
   const ext = extOf(first.uri);
-  if (ext === 'm4s' || ext === 'mp4' || ext === 'cmfv' || ext === 'cmfa' || ext === 'm4a' || ext === 'm4v') return 'fmp4';
-  if (ext === 'aac' || ext === 'mp3' || ext === 'ac3' || ext === 'ec3') return 'packed-audio';
+  if (['m4s', 'mp4', 'cmfv', 'cmfa', 'm4a', 'm4v'].includes(ext)) return 'fmp4';
+  if (['aac', 'mp3', 'ac3', 'ec3'].includes(ext)) return 'packed-audio';
   return 'mpegts';
 }
 
-function ivFor(segment: Segment): Buffer {
-  const iv = segment.key?.iv;
-  if (iv && /^0x[0-9a-f]+$/i.test(iv)) {
-    const hex = iv.slice(2).padStart(32, '0').slice(-32);
-    return Buffer.from(hex, 'hex');
-  }
-  const buf = Buffer.alloc(16);
-  buf.writeBigUInt64BE(BigInt(segment.sequence), 8);
-  return buf;
+function containerOf(result: SniffResult): Container {
+  if (result.container === 'mp4') return 'fmp4';
+  return result.container;
 }
 
 function rangeHeader(start: number, length: number): string {
   return `bytes=${start}-${start + length - 1}`;
 }
 
-async function fetchKey(url: string, ctx: RequestContext): Promise<{ status: number | null; key: Buffer | null }> {
-  if (!isHttpUrl(url)) return { status: null, key: null };
+interface KeyCheck {
+  status: number | null;
+  key: Uint8Array | null;
+  error: string | null;
+}
+
+async function fetchKey(url: string, ctx: RequestContext): Promise<KeyCheck> {
+  if (!isHttpUrl(url)) return { status: null, key: null, error: `key URI is not http(s) (${url.split(':')[0]}:)` };
   try {
     const res = await get(url, ctx, { maxBytes: 4096 });
-    return { status: res.status, key: res.ok && res.body.byteLength === 16 ? Buffer.from(res.body) : null };
-  } catch {
-    return { status: null, key: null };
+    return { status: res.status, key: res.ok && res.body.byteLength === 16 ? res.body : null, error: null };
+  } catch (err) {
+    return { status: null, key: null, error: (err as Error).message };
   }
 }
 
-async function probeSegment(m: MediaPlaylist, ctx: RequestContext, key: Buffer | null, enc: Encryption): Promise<MediaReport['probe']> {
-  const first = m.segments[0];
-  if (!first) return { tracks: [], note: 'The playlist has no segments yet.' };
-  if (enc.kind === 'drm') return null;
-  if (!isHttpUrl(first.uri)) return { tracks: [], note: 'Relative segment URLs: pass --base <url> to probe them.' };
+interface ProbeOutcome {
+  tracks: SniffedTrack[];
+  container: Container | null;
+  drm: DrmSystem[];
+  note: string | null;
+}
+
+function drmFromSniff(result: SniffResult, playlistHasAes: boolean): DrmSystem[] {
+  const encryptedSamples = result.tracks.some((t) => t.encrypted);
+  const systems = new Set<DrmSystem>();
+  for (const id of result.psshSystems) {
+    const s = psshSystem(id);
+    if (s !== 'clearkey') systems.add(s);
+  }
+  // CENC-encrypted samples without an HLS key the player could fetch = DRM.
+  if (encryptedSamples && systems.size === 0 && !playlistHasAes) systems.add('unknown-drm');
+  return [...systems];
+}
+
+async function decryptIfNeeded(bytes: Uint8Array, key: KeyTag | null, sequence: number, keys: Map<string, KeyCheck>, ctx: RequestContext): Promise<{ bytes: Uint8Array; failed: string | null }> {
+  if (!key || key.method !== 'AES-128' || !key.uri) return { bytes, failed: null };
+  let check = keys.get(key.uri);
+  if (!check) {
+    check = await fetchKey(key.uri, ctx);
+    keys.set(key.uri, check);
+  }
+  if (!check.key) return { bytes, failed: 'the AES-128 key could not be fetched' };
+  return { bytes: await aes128CbcDecryptPrefix(check.key, hlsIv(key.iv, sequence), bytes), failed: null };
+}
+
+async function probeSegment(m: MediaPlaylist, ctx: RequestContext, keys: Map<string, KeyCheck>, playlistHasAes: boolean): Promise<ProbeOutcome> {
+  const first: Segment | undefined = m.segments[0];
+  const empty = (note: string): ProbeOutcome => ({ tracks: [], container: null, drm: [], note });
+  if (!first) return empty('The playlist has no segments yet.');
+  if (!isHttpUrl(first.uri)) return empty('Relative segment URLs: pass --base <url> to probe them.');
 
   try {
     if (first.map) {
+      if (!isHttpUrl(first.map.uri)) return empty('The init segment URI is not http(s), it was not fetched.');
       const r = first.map.byteRange;
-      const res = await get(first.map.uri, ctx, { maxBytes: 2 * 1024 * 1024, ...(r ? { range: rangeHeader(r.offset ?? 0, r.length) } : {}) });
-      if (!res.ok && res.status !== 206) return { tracks: [], note: `Init segment returned HTTP ${res.status}.` };
-      const result = sniff(res.body);
-      return { tracks: result.tracks, note: noteFor(result) };
-    }
-    if (enc.kind === 'sample-aes') {
-      // Headers stay readable under SAMPLE-AES: only the samples are encrypted.
-    } else if (enc.kind === 'aes-128' && !key) {
-      return { tracks: [], note: 'Segments are AES-128 encrypted and the key could not be fetched, so the tracks cannot be inspected.' };
+      const res = await get(first.map.uri, ctx, { maxBytes: INIT_BYTES, ...(r ? { range: rangeHeader(r.offset ?? 0, r.length) } : {}) });
+      if (!res.ok) return empty(`Init segment returned HTTP ${res.status}.`);
+      // An init segment encrypted with AES-128 uses the IV of the key that applies to EXT-X-MAP.
+      const { bytes, failed } = await decryptIfNeeded(res.body, first.map.key, first.sequence, keys, ctx);
+      if (failed) return empty(`The init segment is encrypted and ${failed}, so the tracks cannot be inspected.`);
+      const result = sniff(bytes);
+      return { tracks: result.tracks, container: 'fmp4', drm: drmFromSniff(result, playlistHasAes), note: result.tracks.length ? null : 'The init segment declares no track.' };
     }
     const r = first.byteRange;
     const want = r ? Math.min(r.length, PROBE_BYTES) : PROBE_BYTES;
     const res = await get(first.uri, ctx, { maxBytes: want, range: rangeHeader(r?.offset ?? 0, want) });
-    if (!res.ok && res.status !== 206) return { tracks: [], note: `First segment returned HTTP ${res.status}.` };
-    let bytes: Uint8Array = res.body;
-    if (enc.kind === 'aes-128' && key) {
-      const usable = bytes.byteLength - (bytes.byteLength % 16);
-      const decipher = createDecipheriv('aes-128-cbc', key, ivFor(first));
-      decipher.setAutoPadding(false);
-      bytes = Buffer.concat([decipher.update(bytes.subarray(0, usable)), decipher.final()]);
-    }
+    if (!res.ok) return empty(`First segment returned HTTP ${res.status}.`);
+    // Decide from the key of THIS segment: a clear pre-roll can precede encrypted segments.
+    const { bytes, failed } = await decryptIfNeeded(res.body, first.key, first.sequence, keys, ctx);
+    if (failed) return empty(`Segments are encrypted and ${failed}, so the tracks cannot be inspected.`);
     const result = sniff(bytes);
     if (result.container === 'unknown') {
-      return { tracks: [], note: 'The first segment is not MPEG-TS, MP4 or raw audio (wrong key, an HTML error page, or an exotic format).' };
+      return empty('The first segment is not MPEG-TS, MP4 or raw audio (wrong key, an HTML error page, or an exotic format).');
     }
-    return { tracks: result.tracks, note: noteFor(result) };
+    return { tracks: result.tracks, container: containerOf(result), drm: drmFromSniff(result, playlistHasAes), note: null };
   } catch (err) {
-    return { tracks: [], note: `Probe failed: ${(err as Error).message}` };
+    return empty(`Probe failed: ${(err as Error).message}`);
   }
 }
 
-function noteFor(result: SniffResult): string | null {
-  if (result.psshSystems.length > 0 || result.tracks.some((t) => t.encrypted)) {
-    return `Encrypted samples${result.scheme ? ` (${result.scheme})` : ''}${result.psshSystems.length ? `, DRM system ids ${result.psshSystems.join(', ')}` : ''}.`;
-  }
-  return null;
+async function fetchMedia(url: string, ctx: RequestContext): Promise<MediaPlaylist> {
+  const res = await get(url, ctx, { maxBytes: 16 * 1024 * 1024 });
+  if (!res.ok) throw new FetchError(`Media playlist returned HTTP ${res.status} (${url})`, url);
+  const parsed = parsePlaylist(new TextDecoder().decode(res.body), res.url);
+  if (parsed.kind !== 'media') throw new FetchError('Expected a media playlist but got another master playlist', url);
+  return parsed;
 }
 
-async function inspectMedia(url: string, ctx: RequestContext, probe: boolean, preParsed?: MediaPlaylist): Promise<MediaReport> {
-  let playlist = preParsed;
-  if (!playlist) {
-    const res = await get(url, ctx, { maxBytes: 16 * 1024 * 1024 });
-    if (!res.ok) throw new FetchError(`Media playlist returned HTTP ${res.status}`, url);
-    const parsed = parsePlaylist(new TextDecoder().decode(res.body), res.url);
-    if (parsed.kind !== 'media') throw new FetchError('Expected a media playlist but got another master playlist', url);
-    playlist = parsed;
-  }
+async function inspectMedia(url: string, playlist: MediaPlaylist, ctx: RequestContext, probe: boolean): Promise<MediaReport> {
   const encryption = classifyEncryption(playlist.keys);
+  const keys = new Map<string, KeyCheck>();
   let key: MediaReport['key'] = null;
-  let keyBytes: Buffer | null = null;
   if (encryption.kind === 'aes-128' && encryption.keyUri) {
     const k = await fetchKey(encryption.keyUri, ctx);
-    keyBytes = k.key;
-    key = { url: encryption.keyUri, status: k.status, validLength: k.status !== null && k.status < 400 ? k.key !== null : null };
+    keys.set(encryption.keyUri, k);
+    key = { url: encryption.keyUri, status: k.status, validLength: k.status !== null && k.status < 400 ? k.key !== null : null, error: k.error };
   }
   const exts = [...new Set(playlist.segments.slice(0, 50).map((s) => extOf(s.uri)))];
-  const probed = probe ? await probeSegment(playlist, ctx, keyBytes, encryption) : null;
-  let container = guessContainer(playlist);
-  if (probed && probed.tracks.length > 0 && container === 'mpegts' && playlist.segments[0] && !playlist.segments[0].map) {
-    const audioOnly = probed.tracks.every((t) => t.type === 'audio');
-    if (audioOnly && extOf(playlist.segments[0].uri) !== 'ts') container = 'packed-audio';
-  }
+  const probed = probe && encryption.kind !== 'drm' ? await probeSegment(playlist, ctx, keys, encryption.kind === 'aes-128') : null;
   return {
     url,
     type: mediaType(playlist),
     durationSec: Math.round(playlist.segments.reduce((s, x) => s + x.duration, 0) * 1000) / 1000,
     segments: playlist.segments.length,
     targetDuration: playlist.targetDuration,
-    container,
+    container: probed?.container ?? guessContainer(playlist),
     encryption,
     key,
     byteRanges: playlist.segments.some((s) => s.byteRange !== null),
     discontinuities: playlist.discontinuities,
     lowLatency: playlist.lowLatency,
     segmentExtensions: exts,
-    probe: probed,
+    probe: probed ? { tracks: probed.tracks, drm: probed.drm, note: probed.note } : null,
   };
 }
 
@@ -255,6 +280,10 @@ export function formatDuration(sec: number): string {
   return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`;
 }
 
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
 function tracksOf(m: MediaReport | null, kind: 'video' | 'audio'): SniffedTrack[] {
   return m?.probe?.tracks.filter((t) => t.type === kind) ?? [];
 }
@@ -263,30 +292,40 @@ function probed(m: MediaReport | null): boolean {
   return !!m?.probe && m.probe.tracks.length > 0;
 }
 
+const DRM_DETAIL = 'DRM-protected streams cannot be saved with ffmpeg, and removing DRM is illegal in most countries. m3u8-doctor stops here.';
+
 function encryptionFindings(m: MediaReport, label: string, out: Finding[]): void {
   const e = m.encryption;
-  if (e.kind === 'none') return;
   if (e.kind === 'drm') {
-    out.push({
-      severity: 'error',
-      code: 'DRM',
-      title: `${label} is protected by DRM (${e.systems.join(', ')})`,
-      detail: 'DRM-protected streams cannot be saved by ffmpeg or any honest tool, and circumventing DRM is illegal in most countries. m3u8-doctor stops here.',
-    });
+    out.push({ severity: 'error', code: 'DRM', title: `${label} is protected by DRM (${e.systems.join(', ')})`, detail: DRM_DETAIL });
     return;
   }
+  if (m.probe && m.probe.drm.length > 0) {
+    out.push({ severity: 'error', code: 'DRM', title: `${label} is protected by DRM (${m.probe.drm.join(', ')}, found in the init segment)`, detail: DRM_DETAIL });
+    return;
+  }
+  if (e.kind === 'none') return;
   if (e.kind === 'sample-aes') {
     out.push({
       severity: 'warn',
       code: 'SAMPLE_AES',
       title: `${label} uses SAMPLE-AES encryption`,
-      detail: 'ffmpeg 5.0 and later decrypt SAMPLE-AES in MPEG-TS segments when the key is reachable. Older versions produce a corrupt file.',
+      detail: 'Recent ffmpeg builds decrypt SAMPLE-AES in MPEG-TS segments (H.264, AAC, AC-3) when the key is reachable. Older builds produce a corrupt file.',
       learnMore: GUIDES.encrypted,
     });
     return;
   }
   const k = m.key;
-  if (k && k.status !== null && k.status >= 400) {
+  if (!k) return;
+  if (k.status === null) {
+    out.push({
+      severity: 'warn',
+      code: 'AES_KEY_UNCHECKED',
+      title: `${label} is AES-128 encrypted and the key could not be checked`,
+      detail: `${k.error ?? 'The key request failed'}. ffmpeg will need to fetch it with the same headers.`,
+      learnMore: GUIDES.encrypted,
+    });
+  } else if (k.status >= 400) {
     out.push({
       severity: 'error',
       code: 'AES_KEY_UNREACHABLE',
@@ -294,49 +333,48 @@ function encryptionFindings(m: MediaReport, label: string, out: Finding[]): void
       detail: 'The key server wants something the request did not send: usually cookies, a Referer or a token that expired. Pass the same headers as the browser (--referer, -H "Cookie: ...") or copy a fresh URL.',
       learnMore: GUIDES.encrypted,
     });
-  } else if (k && k.validLength === false) {
+  } else if (k.validLength === false) {
     out.push({
-      severity: 'warn',
+      severity: 'error',
       code: 'AES_KEY_INVALID',
-      title: `${label} is AES-128 encrypted but the key is not 16 bytes`,
-      detail: 'The key URL answered, but not with a raw 16-byte key (often an HTML login page or a wrapped key). ffmpeg will fail to decrypt.',
+      title: `${label} is AES-128 encrypted but the key URL does not return a 16-byte key`,
+      detail: 'The key URL answered with something else (often an HTML login page or a wrapped key). ffmpeg will fail to decrypt.',
       learnMore: GUIDES.encrypted,
     });
   } else {
-    out.push({
-      severity: 'ok',
-      code: 'AES_128',
-      title: `${label} is AES-128 encrypted, key reachable`,
-      detail: 'Standard HLS encryption (not DRM). ffmpeg fetches the key and decrypts on the fly.',
-    });
+    out.push({ severity: 'ok', code: 'AES_128', title: `${label} is AES-128 encrypted, key reachable`, detail: 'Standard HLS encryption, not DRM: ffmpeg fetches the key and decrypts on the fly.' });
   }
 }
 
-function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
+function videoExpected(r: Report): boolean {
+  if (tracksOf(r.video, 'video').length > 0) return true;
+  if (probed(r.video)) return false;
+  const v = r.selected?.variant;
+  return v ? hasCodec(v, 'video') !== false : true;
+}
+
+function buildFindings(r: Report, master: MasterPlaylist | null, now: Date): Finding[] {
   const out: Finding[] = [];
   const v = r.video;
   const a = r.audio;
 
-  if (master && r.master) {
-    const total = r.master.variants.length;
-    if (total === 0) out.push({ severity: 'warn', code: 'NO_VARIANTS', title: 'The master playlist lists no video variants' });
-  }
+  if (master && master.variants.length === 0) out.push({ severity: 'warn', code: 'NO_VARIANTS', title: 'The master playlist lists no variants' });
 
-  for (const [m, label] of [[v, r.audio ? 'Video' : 'Stream'], [a, 'Audio']] as const) {
-    if (m) encryptionFindings(m, label, out);
-  }
-  if (r.master && master) {
+  if (v) encryptionFindings(v, a ? 'Video' : 'Stream', out);
+  if (a) encryptionFindings(a, 'Audio', out);
+  if (master) {
     for (const key of master.sessionKeys) {
       const enc = classifyEncryption([key]);
       if (enc.kind === 'drm' && !out.some((f) => f.code === 'DRM')) {
-        out.push({ severity: 'error', code: 'DRM', title: `Protected by DRM (${enc.systems.join(', ')}), declared in the master playlist`, detail: 'DRM-protected streams cannot be saved by ffmpeg or any honest tool. m3u8-doctor stops here.' });
+        out.push({ severity: 'error', code: 'DRM', title: `Protected by DRM (${enc.systems.join(', ')}), declared in the master playlist`, detail: DRM_DETAIL });
       }
     }
   }
 
   // Sound: the reason this tool exists.
   const variant = r.selected?.variant ?? null;
-  if (a) {
+  const hasVideo = videoExpected(r);
+  if (a && hasVideo) {
     out.push({
       severity: 'warn',
       code: 'SEPARATE_AUDIO',
@@ -344,7 +382,7 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
       detail: 'The video variant carries no sound of its own. Downloading only the video URL gives a silent file. The command below downloads both and merges them.',
       learnMore: GUIDES.noSound,
     });
-  } else if (variant && hasAudioCodec(variant) === false && !variant.audioGroup) {
+  } else if (variant && hasCodec(variant, 'audio') === false && !variant.audioGroup) {
     out.push({
       severity: 'warn',
       code: 'VIDEO_ONLY_VARIANT',
@@ -355,9 +393,9 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
   }
 
   if (probed(v)) {
-    const hasVideo = tracksOf(v, 'video').length > 0;
-    const hasAudio = tracksOf(v, 'audio').length > 0;
-    if (!a && hasVideo && !hasAudio) {
+    const vHasVideo = tracksOf(v, 'video').length > 0;
+    const vHasAudio = tracksOf(v, 'audio').length > 0;
+    if (!a && vHasVideo && !vHasAudio) {
       out.push({
         severity: 'error',
         code: 'NO_AUDIO_TRACK',
@@ -367,14 +405,13 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
           : 'The first segment has a video track and no audio track. The source itself may be silent, or the audio is served outside HLS.',
         learnMore: r.playlist === 'media' ? GUIDES.findUrl : GUIDES.noSound,
       });
-    } else if (!a && !hasVideo && hasAudio && r.playlist === 'media') {
-      out.push({ severity: 'info', code: 'AUDIO_ONLY', title: 'This playlist is audio only', detail: 'Use the master playlist to get the matching video.', learnMore: GUIDES.findUrl });
-    } else if (hasVideo && (hasAudio || a)) {
+    } else if (!vHasVideo && (vHasAudio || a)) {
+      out.push({ severity: 'info', code: 'AUDIO_ONLY', title: 'Audio only: this stream has no picture', ...(r.playlist === 'media' ? { detail: 'Use the master playlist to get the matching video.', learnMore: GUIDES.findUrl } : {}) });
+    } else if (vHasVideo && (vHasAudio || a)) {
       const names = [...tracksOf(v, 'video'), ...tracksOf(v, 'audio'), ...tracksOf(a, 'audio')].map((t) => codecName(t.codec));
       out.push({ severity: 'ok', code: 'TRACKS', title: `Picture and sound found (${[...new Set(names)].join(' + ')})` });
     }
-    const vVideo = tracksOf(v, 'video')[0];
-    if (vVideo?.codec === 'hevc') {
+    if (tracksOf(v, 'video')[0]?.codec === 'hevc') {
       out.push({ severity: 'info', code: 'HEVC_TAG', title: 'HEVC video: the command tags it hvc1 so QuickTime and iOS can play it' });
     }
   }
@@ -391,13 +428,14 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
         severity: 'warn',
         code: 'LIVE',
         title: 'Live stream: ffmpeg records from now until you stop it',
-        detail: 'Press q to stop cleanly. Add -t 3600 to stop after one hour. Earlier parts of the broadcast cannot be fetched from a sliding live playlist.',
+        detail: 'The command writes .ts so the file stays playable even if the recording is cut. Press q to stop, or add -t 3600 for one hour. A sliding live playlist cannot give back what aired before.',
         learnMore: GUIDES.live,
       });
     } else if (v.type === 'event') {
-      out.push({ severity: 'info', code: 'EVENT', title: 'Event playlist still growing: the recording stops at the current end unless you rerun it later', learnMore: GUIDES.live });
+      out.push({ severity: 'info', code: 'EVENT', title: 'Event playlist still growing: the recording stops at the current end unless you run it again later', learnMore: GUIDES.live });
     } else {
-      out.push({ severity: 'ok', code: 'VOD', title: `On-demand video, ${formatDuration(v.durationSec)} in ${v.segments} segments (${v.container === 'fmp4' ? 'fragmented MP4' : v.container === 'mpegts' ? 'MPEG-TS' : v.container})` });
+      const label = v.container === 'fmp4' ? 'fragmented MP4' : v.container === 'mpegts' ? 'MPEG-TS' : v.container === 'packed-audio' ? 'raw audio' : 'unknown format';
+      out.push({ severity: 'ok', code: 'VOD', title: `On-demand, ${formatDuration(v.durationSec)} in ${plural(v.segments, 'segment', 'segments')} (${label})` });
     }
     if (v.lowLatency) out.push({ severity: 'info', code: 'LL_HLS', title: 'Low-Latency HLS playlist: ffmpeg reads the full segments and ignores the partial ones' });
     if (v.byteRanges) out.push({ severity: 'info', code: 'BYTERANGE', title: 'Segments are byte ranges of one file (EXT-X-BYTERANGE), ffmpeg handles it' });
@@ -405,28 +443,28 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
       out.push({
         severity: 'warn',
         code: 'DISCONTINUITY',
-        title: `${v.discontinuities} discontinuit${v.discontinuities > 1 ? 'ies' : 'y'} (inserted ads or spliced parts)`,
-        detail: 'Timestamps restart at each discontinuity. If the result stutters or desyncs, re-encode instead of -c copy.',
+        title: `${plural(v.discontinuities, 'discontinuity', 'discontinuities')} (inserted ads or spliced parts)`,
+        detail: 'Timestamps restart at each discontinuity. If the result stutters or loses sync, re-encode instead of copying (-c copy).',
       });
     }
-    const odd = [...v.segmentExtensions, ...(a?.segmentExtensions ?? [])].filter((e) => e && !NORMAL_SEGMENT_EXT.has(e));
+    const odd = [...v.segmentExtensions, ...(a?.segmentExtensions ?? [])].filter((e) => DISGUISE_EXT.has(e));
     if (odd.length > 0) {
       out.push({
         severity: 'warn',
         code: 'DISGUISED_SEGMENTS',
-        title: `Segments use unusual extensions (.${[...new Set(odd)].join(', .')})`,
-        detail: 'Recent ffmpeg versions refuse segments whose extension does not match their content. If ffmpeg stops with an "extension" error, add -extension_picky 0 before -i (ffmpeg 7.1 and later).',
+        title: `Segments are disguised with non-media extensions (.${[...new Set(odd)].join(', .')})`,
+        detail: 'Recent ffmpeg builds check segment extensions. If ffmpeg stops with an error about the extension, add -extension_picky 0 before each -i (that option does not exist in older builds, which accept these segments anyway).',
       });
     }
   }
 
   if (r.signedUrlExpiresAt) {
-    const expired = Date.parse(r.signedUrlExpiresAt) <= Date.now();
+    const expired = Date.parse(r.signedUrlExpiresAt) <= now.getTime();
     out.push({
-      severity: expired ? 'error' : 'info',
+      severity: expired ? 'warn' : 'info',
       code: expired ? 'SIGNED_URL_EXPIRED' : 'SIGNED_URL',
-      title: expired ? `The signed URL expired at ${r.signedUrlExpiresAt}` : `Signed URL, valid until ${r.signedUrlExpiresAt}`,
-      detail: expired ? 'Reload the page and copy a fresh URL.' : 'Download before it expires, or copy a fresh one from the page.',
+      title: expired ? `The URL looks signed and its expiry date passed (${r.signedUrlExpiresAt})` : `Signed URL, valid until ${r.signedUrlExpiresAt}`,
+      detail: expired ? 'The server still answered, but segments or the key may be refused midway. Copy a fresh URL if ffmpeg fails.' : 'Download before it expires, or copy a fresh one from the page.',
       learnMore: GUIDES.findUrl,
     });
   }
@@ -435,113 +473,29 @@ function buildFindings(r: Report, master: MasterPlaylist | null): Finding[] {
 }
 
 function commandFor(r: Report, ctx: RequestContext, opts: DiagnoseOptions): string | null {
-  if (!r.downloadable || !r.url || !isHttpUrl(r.url)) return null;
-  const userAgent = opts.userAgent ?? (ctx.usedBrowserUA ? BROWSER_UA : null);
+  if (!r.downloadable) return null;
+  const video = r.video;
+  if (!video || !isHttpUrl(video.url)) return null;
   const headers = { ...(opts.headers ?? {}) };
   delete headers['User-Agent'];
-  const inputs: CommandInput[] = [{ url: r.video?.url ?? r.url, headers, userAgent }];
+  const userAgent = opts.userAgent ?? (ctx.usedBrowserUA ? BROWSER_UA : null);
+  const live = video.type === 'live';
+  const hasVideo = videoExpected(r);
+
+  const inputs: CommandInput[] = [];
   const maps: string[] = [];
-  if (r.audio) {
-    inputs.push({ url: r.audio.url, headers, userAgent });
+  if (r.audio && isHttpUrl(r.audio.url) && hasVideo) {
+    inputs.push({ url: video.url, headers, userAgent }, { url: r.audio.url, headers, userAgent });
     maps.push('0:v:0', '1:a:0');
+  } else {
+    inputs.push({ url: r.audio && !hasVideo ? r.audio.url : video.url, headers, userAgent });
+    if (!hasVideo) maps.push('0:a:0');
   }
+  const ext = live ? 'ts' : hasVideo ? 'mp4' : 'm4a';
   const outputOptions: string[] = [];
-  if (tracksOf(r.video, 'video')[0]?.codec === 'hevc') outputOptions.push('-tag:v', 'hvc1');
-  return buildFfmpegCommand({ inputs, maps, output: opts.output ?? outputName(r.url), outputOptions }, opts.shell ?? defaultShell());
-}
-
-
-export async function diagnose(input: string, opts: DiagnoseOptions = {}): Promise<Report> {
-  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  if (opts.userAgent) headers['User-Agent'] = opts.userAgent;
-  const ctx: RequestContext = { headers, timeoutMs: opts.timeoutMs ?? 15000, usedBrowserUA: false, userAgentGiven: !!opts.userAgent };
-  const probe = opts.probe !== false;
-
-  const report: Report = {
-    input,
-    url: null,
-    playlist: null,
-    master: null,
-    selected: null,
-    video: null,
-    audio: null,
-    signedUrlExpiresAt: null,
-    findings: [],
-    downloadable: false,
-    command: null,
-    shell: opts.shell ?? defaultShell(),
-  };
-
-  let loaded: Awaited<ReturnType<typeof loadText>>;
-  try {
-    loaded = await loadText(input, ctx);
-  } catch (err) {
-    report.findings.push({ severity: 'error', code: 'FETCH_FAILED', title: (err as Error).message });
-    return report;
-  }
-  report.url = opts.baseUrl ?? loaded.url;
-  const expiry = isHttpUrl(input) ? signedUrlExpiry(input) : null;
-  if (expiry) report.signedUrlExpiresAt = new Date(expiry * 1000).toISOString().replace('.000Z', 'Z');
-
-  if (loaded.status >= 400) {
-    report.findings.push(httpFinding(loaded.status, ctx));
-    if (expiry && expiry * 1000 <= Date.now()) report.findings.push({ severity: 'error', code: 'SIGNED_URL_EXPIRED', title: `The signed URL expired at ${report.signedUrlExpiresAt}`, detail: 'Reload the page and copy a fresh URL.', learnMore: GUIDES.findUrl });
-    return report;
-  }
-
-  let parsed;
-  try {
-    parsed = parsePlaylist(loaded.text, report.url);
-  } catch (err) {
-    if (err instanceof PlaylistError) {
-      report.findings.push({
-        severity: 'error',
-        code: `NOT_HLS_${err.code}`,
-        title: err.message,
-        ...(err.code === 'DASH' ? { detail: 'Use ffmpeg or yt-dlp directly on the .mpd URL.', learnMore: GUIDES.dash } : {}),
-        ...(err.code === 'HTML' ? { detail: 'Often a login page, a geo-block or an expired link. Copy the .m3u8 request from DevTools while the video plays.', learnMore: GUIDES.findUrl } : {}),
-      });
-      return report;
-    }
-    throw err;
-  }
-  report.playlist = parsed.kind;
-
-  try {
-    if (parsed.kind === 'master') {
-      const variant = pickVariant(parsed.variants, opts.maxHeight);
-      const audio = pickAudio(parsed, variant);
-      report.master = {
-        variants: parsed.variants,
-        audio: parsed.renditions.filter((r) => r.type === 'AUDIO'),
-        subtitles: parsed.renditions.filter((r) => r.type === 'SUBTITLES'),
-        iFrameVariants: parsed.iFrameVariants,
-      };
-      report.selected = { variant, audio };
-      const canFetch = (u: string | undefined) => !!u && isHttpUrl(u);
-      const [video, audioReport] = await Promise.all([
-        canFetch(variant?.uri) ? inspectMedia(variant!.uri, ctx, probe) : Promise.resolve(null),
-        canFetch(audio?.uri ?? undefined) ? inspectMedia(audio!.uri!, ctx, probe) : Promise.resolve(null),
-      ]);
-      report.video = video;
-      report.audio = audioReport;
-      if (variant && !canFetch(variant.uri)) {
-        report.findings.push({ severity: 'info', code: 'RELATIVE_URIS', title: 'Relative URIs in a local file: pass --base <url> to inspect the variants' });
-      }
-    } else {
-      report.video = await inspectMedia(report.url ?? input, ctx, probe && !!report.url && isHttpUrl(report.url), parsed);
-    }
-  } catch (err) {
-    report.findings.push({ severity: 'error', code: 'MEDIA_FETCH_FAILED', title: (err as Error).message });
-  }
-
-  report.findings.push(...buildFindings(report, parsed.kind === 'master' ? parsed : null));
-  if (ctx.usedBrowserUA) {
-    report.findings.push({ severity: 'info', code: 'BROWSER_UA', title: 'The server rejects non-browser clients: the command sends a browser User-Agent' });
-  }
-  report.downloadable = !report.findings.some((f) => f.severity === 'error' && f.code !== 'NO_AUDIO_TRACK');
-  report.command = commandFor(report, ctx, opts);
-  return report;
+  if (hasVideo && !live && tracksOf(video, 'video')[0]?.codec === 'hevc') outputOptions.push('-tag:v', 'hvc1');
+  const base = r.url && isHttpUrl(r.url) ? r.url : video.url;
+  return buildFfmpegCommand({ inputs, maps, output: opts.output ?? outputName(base, ext), outputOptions }, opts.shell ?? defaultShell());
 }
 
 function httpFinding(status: number, ctx: RequestContext): Finding {
@@ -559,4 +513,110 @@ function httpFinding(status: number, ctx: RequestContext): Finding {
   }
   if (status === 429) return { severity: 'error', code: 'HTTP_RATE_LIMITED', title: 'Rate limited by the server (HTTP 429)', detail: 'Wait a minute and retry.' };
   return { severity: 'error', code: 'HTTP_ERROR', title: `The server answered HTTP ${status}` };
+}
+
+function notHlsFinding(err: PlaylistError): Finding {
+  return {
+    severity: 'error',
+    code: `NOT_HLS_${err.code}`,
+    title: err.message,
+    ...(err.code === 'DASH' ? { detail: 'Use ffmpeg or yt-dlp directly on the .mpd URL.', learnMore: GUIDES.dash } : {}),
+    ...(err.code === 'HTML' ? { detail: 'Often a login page, a geo-block or an expired link. Copy the .m3u8 request from DevTools while the video plays.', learnMore: GUIDES.findUrl } : {}),
+  };
+}
+
+export async function diagnose(input: string, opts: DiagnoseOptions = {}): Promise<Report> {
+  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+  if (opts.userAgent) headers['User-Agent'] = opts.userAgent;
+  const ctx: RequestContext = { headers, timeoutMs: opts.timeoutMs ?? 15000, usedBrowserUA: false, userAgentGiven: !!opts.userAgent };
+  const probe = opts.probe !== false;
+  const now = opts.now ?? new Date();
+
+  const report: Report = {
+    input,
+    url: null,
+    playlist: null,
+    master: null,
+    selected: null,
+    video: null,
+    audio: null,
+    signedUrlExpiresAt: null,
+    findings: [],
+    downloadable: false,
+    command: null,
+    shell: opts.shell ?? defaultShell(),
+  };
+
+  let loaded: LoadedText;
+  try {
+    loaded = await loadText(input, ctx);
+  } catch (err) {
+    report.findings.push({ severity: 'error', code: 'FETCH_FAILED', title: (err as Error).message });
+    return report;
+  }
+  report.url = loaded.url;
+  const expiry = isHttpUrl(input) ? signedUrlExpiry(input) : null;
+  if (expiry) report.signedUrlExpiresAt = new Date(expiry * 1000).toISOString().replace('.000Z', 'Z');
+
+  if (loaded.status >= 400) {
+    report.findings.push(httpFinding(loaded.status, ctx));
+    if (expiry && expiry * 1000 <= now.getTime()) {
+      report.findings.push({ severity: 'info', code: 'SIGNED_URL_EXPIRED', title: `The URL looks signed and expired at ${report.signedUrlExpiresAt}`, detail: 'That is the likely cause: reload the page and copy a fresh URL.', learnMore: GUIDES.findUrl });
+    }
+    return report;
+  }
+  if (loaded.truncated) {
+    report.findings.push({ severity: 'error', code: 'PLAYLIST_TOO_LARGE', title: 'The playlist is larger than 16 MB and was not analyzed' });
+    return report;
+  }
+
+  const base = loaded.local ? (opts.baseUrl ?? null) : loaded.url;
+  let parsed: Playlist;
+  try {
+    parsed = parsePlaylist(loaded.text, base);
+  } catch (err) {
+    if (err instanceof PlaylistError) {
+      report.findings.push(notHlsFinding(err));
+      return report;
+    }
+    throw err;
+  }
+  report.playlist = parsed.kind;
+  if (loaded.local && !opts.baseUrl) {
+    report.findings.push({ severity: 'info', code: 'RELATIVE_URIS', title: 'Local file: relative URIs cannot be fetched. Pass --base with the playlist URL to inspect variants and segments' });
+  }
+
+  try {
+    if (parsed.kind === 'master') {
+      const variant = pickVariant(parsed.variants, opts.maxHeight);
+      const audio = pickAudio(parsed, variant);
+      report.master = {
+        variants: parsed.variants,
+        audio: parsed.renditions.filter((r) => r.type === 'AUDIO'),
+        subtitles: parsed.renditions.filter((r) => r.type === 'SUBTITLES'),
+        iFrameVariants: parsed.iFrameVariants,
+      };
+      report.selected = { variant, audio };
+      const fetchable = (u: string | null | undefined): u is string => !!u && isHttpUrl(u);
+      const [video, audioReport] = await Promise.all([
+        fetchable(variant?.uri) ? fetchMedia(variant!.uri, ctx).then((m) => inspectMedia(variant!.uri, m, ctx, probe)) : Promise.resolve(null),
+        fetchable(audio?.uri) ? fetchMedia(audio!.uri!, ctx).then((m) => inspectMedia(audio!.uri!, m, ctx, probe)) : Promise.resolve(null),
+      ]);
+      report.video = video;
+      report.audio = audioReport;
+    } else {
+      const url = loaded.local ? (opts.baseUrl ?? loaded.url ?? input) : (loaded.url ?? input);
+      report.video = await inspectMedia(url, parsed, ctx, probe && isHttpUrl(url));
+    }
+  } catch (err) {
+    report.findings.push({ severity: 'error', code: err instanceof PlaylistError ? `NOT_HLS_${err.code}` : 'MEDIA_FETCH_FAILED', title: (err as Error).message });
+  }
+
+  report.findings.push(...buildFindings(report, parsed.kind === 'master' ? parsed : null, now));
+  if (ctx.usedBrowserUA) {
+    report.findings.push({ severity: 'info', code: 'BROWSER_UA', title: 'The server rejects non-browser clients: the command sends a browser User-Agent' });
+  }
+  report.downloadable = !report.findings.some((f) => f.severity === 'error' && f.code !== 'NO_AUDIO_TRACK');
+  report.command = commandFor(report, ctx, opts);
+  return report;
 }

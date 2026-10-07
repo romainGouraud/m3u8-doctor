@@ -92,10 +92,13 @@ export function signedUrlExpiry(url: string): number | null {
     return null;
   }
   const q = u.searchParams;
+  // Only plausible timestamps (2015-2100): `e=123456789` is not an expiry.
+  const MIN = 1420070400;
+  const MAX = 4102444800;
   const asEpoch = (v: string | null): number | null => {
-    if (!v || !/^\d{9,13}$/.test(v)) return null;
-    const n = Number(v);
-    return n > 1e12 ? Math.floor(n / 1000) : n;
+    if (!v || !/^\d{10}(\d{3})?$/.test(v)) return null;
+    const n = v.length === 13 ? Math.floor(Number(v) / 1000) : Number(v);
+    return n >= MIN && n <= MAX ? n : null;
   };
   for (const name of ['Expires', 'expires', 'exp', 'e', 'expiry', 'expire', 'Expire']) {
     const v = asEpoch(q.get(name));
@@ -111,6 +114,18 @@ export function signedUrlExpiry(url: string): number | null {
   // Akamai token: hdnts=exp=1700000000~acl=...
   const hdnts = q.get('hdnts') ?? q.get('__token__');
   const m = hdnts ? /(?:^|~)exp=(\d{9,10})/.exec(hdnts) : null;
-  if (m) return Number(m[1]);
-  return null;
+  const akamai = m ? Number(m[1]) : null;
+  return akamai !== null && akamai >= MIN && akamai <= MAX ? akamai : null;
+}
+
+const PSSH_SYSTEMS: Record<string, DrmSystem> = {
+  'edef8ba9-79d6-4ace-a3c8-27dcd51d21ed': 'widevine',
+  '9a04f079-9840-4286-ab92-e65be0885f95': 'playready',
+  '94ce86fb-07ff-4f43-adb8-93d2fa968ca2': 'fairplay',
+};
+
+/** Maps a pssh SystemID to a DRM name. ClearKey (1077efec...) is not DRM. */
+export function psshSystem(id: string): DrmSystem | 'clearkey' {
+  if (id === '1077efec-c0b2-4d02-ace3-3c1e52e2fb4b' || id === 'e2719d58-a985-b3c9-781a-b030af78d30e') return 'clearkey';
+  return PSSH_SYSTEMS[id] ?? 'unknown-drm';
 }

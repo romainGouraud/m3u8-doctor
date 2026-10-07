@@ -161,3 +161,62 @@ test('outputName skips generic file names', () => {
   assert.equal(outputName('https://cdn.x/index.m3u8'), 'video.mp4');
   assert.equal(outputName('not a url'), 'video.mp4');
 });
+
+test('regression: parseAttributes is linear on hostile input', () => {
+  const t0 = Date.now();
+  parseAttributes('A'.repeat(2_000_000));
+  parseAttributes('X="'.repeat(200_000));
+  assert.ok(Date.now() - t0 < 1500, 'attribute parsing must stay linear');
+});
+
+test('regression: CR-only line endings and negative media sequence', () => {
+  const p = parsePlaylist('#EXTM3U\r#EXT-X-MEDIA-SEQUENCE:-4\r#EXTINF:5,\r a.ts\r#EXT-X-ENDLIST', 'https://x/p.m3u8');
+  assert.equal(p.segments.length, 1);
+  assert.equal(p.segments[0].sequence, 0);
+});
+
+test('regression: pickAudio returns null when the default rendition is muxed (no URI)', async () => {
+  const { pickAudio } = await import('../dist/index.js');
+  const m = parsePlaylist([
+    '#EXTM3U',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="bipbop_audio",LANGUAGE="eng",NAME="BipBop Audio 1",AUTOSELECT=YES,DEFAULT=YES',
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="bipbop_audio",LANGUAGE="eng",NAME="BipBop Audio 2",AUTOSELECT=NO,DEFAULT=NO,URI="alternate_audio_aac/prog_index.m3u8"',
+    '#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="avc1.4d401f,mp4a.40.2",RESOLUTION=960x540,AUDIO="bipbop_audio"',
+    'gear3/prog_index.m3u8',
+  ].join('\n'), 'https://x/m.m3u8');
+  assert.equal(pickAudio(m, m.variants[0]), null);
+});
+
+test('regression: signed-URL expiry ignores implausible numbers', () => {
+  assert.equal(signedUrlExpiry('https://x/a.m3u8?e=123456789'), null);
+  assert.equal(signedUrlExpiry('https://x/a.m3u8?exp=1234567890123456'), null);
+  assert.equal(signedUrlExpiry('https://x/a.m3u8?exp=1760000000000'), 1760000000);
+});
+
+test('regression: PowerShell quoting doubles Unicode single quotes', () => {
+  assert.equal(quote('x’;echo INJECTED;’y', 'powershell'), "'x’’;echo INJECTED;’’y'");
+});
+
+test('regression: deeply nested MP4 boxes do not overflow the stack', () => {
+  let b = Buffer.alloc(0);
+  for (let i = 0; i < 5000; i++) {
+    const head = Buffer.alloc(8);
+    head.writeUInt32BE(8 + b.length);
+    head.write('trak', 4, 'latin1');
+    b = Buffer.concat([head, b]);
+  }
+  const ftyp = Buffer.from([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]);
+  assert.doesNotThrow(() => sniff(Buffer.concat([ftyp, b])));
+});
+
+test('regression: AES prefix decryption with WebCrypto matches node:crypto', async () => {
+  const { aes128 } = await import('./helpers.js');
+  const { aes128CbcDecryptPrefix, hlsIv } = await import('../dist/aes.js');
+  const key = Buffer.alloc(16, 7);
+  const iv = Buffer.from(hlsIv(null, 42));
+  assert.equal(iv.readUInt32BE(12), 42);
+  const plain = makeTs([0x1b, 0x0f], { size: 188 * 30 });
+  const enc = aes128(plain, key, iv);
+  const out = await aes128CbcDecryptPrefix(key, iv, enc.subarray(0, 1000));
+  assert.deepEqual(Buffer.from(out), plain.subarray(0, 992));
+});
