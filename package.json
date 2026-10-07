@@ -1,0 +1,28 @@
+{
+  "name": "m3u8-doctor",
+  "version": "0.1.0",
+  "description": "Explain any HLS (.m3u8) stream in plain words: separate audio, encryption, DRM, live vs VOD, and the exact ffmpeg command that keeps the sound.",
+  "keywords": ["m3u8", "hls", "ffmpeg", "video", "streaming", "cli", "aes-128", "playlist", "no-audio", "downloader"],
+  "license": "MIT",
+  "author": "Romain Gouraud (https://getvidora.com)",
+  "homepage": "https://github.com/romainGouraud/m3u8-doctor#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/romainGouraud/m3u8-doctor.git" },
+  "bugs": { "url": "https://github.com/romainGouraud/m3u8-doctor/issues" },
+  "type": "module",
+  "bin": { "m3u8-doctor": "dist/cli.js" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "README.md", "LICENSE", "CHANGELOG.md"],
+  "engines": { "node": ">=18.17" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.0"
+  }
+}
