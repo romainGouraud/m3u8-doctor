@@ -76,8 +76,9 @@ export function outputName(url: string, ext = 'mp4'): string {
     const segments = u.pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
     const generic = /^(master|index|playlist|manifest|prog_index|chunklist|mono|stream|video|media|hls|main)(_\w+)?\.m3u8$/i;
     const last = segments[segments.length - 1] ?? '';
-    const candidate = generic.test(last) || !/\.m3u8$/i.test(last) ? (segments[segments.length - 2] ?? '') : last;
-    base = candidate.replace(/\.m3u8$/i, '');
+    const own = /\.m3u8$/i.test(last) && !generic.test(last) ? last.replace(/\.m3u8$/i, '') : '';
+    // "/live.isml/.m3u8" or "/movie.ism/master.m3u8": fall back to the parent folder, minus its extension.
+    base = own || (segments[segments.length - 2] ?? '').replace(/\.(m3u8|isml?|mp4|smil|csmil)$/i, '');
   } catch {
     /* keep default */
   }

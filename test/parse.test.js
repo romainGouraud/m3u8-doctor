@@ -160,6 +160,8 @@ test('outputName skips generic file names', () => {
   assert.equal(outputName('https://cdn.x/videos/lecture_01.m3u8?sig=1'), 'lecture_01.mp4');
   assert.equal(outputName('https://cdn.x/index.m3u8'), 'video.mp4');
   assert.equal(outputName('not a url'), 'video.mp4');
+  assert.equal(outputName('https://demo.example/k8s/live/stable/live.isml/.m3u8', 'ts'), 'live.ts');
+  assert.equal(outputName('https://cdn.x/vod/movie.ism/master.m3u8'), 'movie.mp4');
 });
 
 test('regression: parseAttributes is linear on hostile input', () => {
