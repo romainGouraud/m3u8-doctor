@@ -5,7 +5,7 @@
  */
 import { aes128CbcDecryptPrefix, hlsIv } from './aes.js';
 import { codecKind, codecName, classifyEncryption, psshSystem, signedUrlExpiry, type DrmSystem, type Encryption } from './classify.js';
-import { buildFfmpegCommand, defaultShell, outputName, type CommandInput, type Shell } from './command.js';
+import { buildFfmpegCommand, defaultShell, outputName, type CommandInput, type CommandSpec, type Shell } from './command.js';
 import { BROWSER_UA, FetchError, get, isHttpUrl, loadText, type LoadedText, type RequestContext } from './http.js';
 import { parsePlaylist, PlaylistError, type KeyTag, type MasterPlaylist, type MediaPlaylist, type Playlist, type Rendition, type Segment, type Variant } from './playlist.js';
 import { sniff, type SniffResult, type SniffedTrack } from './sniff.js';
@@ -80,6 +80,8 @@ export interface Report {
   findings: Finding[];
   downloadable: boolean;
   command: string | null;
+  /** Structured form of `command`, to re-quote it for another shell with buildFfmpegCommand(). */
+  commandSpec: CommandSpec | null;
   shell: Shell;
 }
 
@@ -472,7 +474,7 @@ function buildFindings(r: Report, master: MasterPlaylist | null, now: Date): Fin
   return out;
 }
 
-function commandFor(r: Report, ctx: RequestContext, opts: DiagnoseOptions): string | null {
+function commandSpecFor(r: Report, ctx: RequestContext, opts: DiagnoseOptions): CommandSpec | null {
   if (!r.downloadable) return null;
   const video = r.video;
   if (!video || !isHttpUrl(video.url)) return null;
@@ -495,7 +497,7 @@ function commandFor(r: Report, ctx: RequestContext, opts: DiagnoseOptions): stri
   const outputOptions: string[] = [];
   if (hasVideo && !live && tracksOf(video, 'video')[0]?.codec === 'hevc') outputOptions.push('-tag:v', 'hvc1');
   const base = r.url && isHttpUrl(r.url) ? r.url : video.url;
-  return buildFfmpegCommand({ inputs, maps, output: opts.output ?? outputName(base, ext), outputOptions }, opts.shell ?? defaultShell());
+  return { inputs, maps, output: opts.output ?? outputName(base, ext), outputOptions };
 }
 
 function httpFinding(status: number, ctx: RequestContext): Finding {
@@ -544,6 +546,7 @@ export async function diagnose(input: string, opts: DiagnoseOptions = {}): Promi
     findings: [],
     downloadable: false,
     command: null,
+    commandSpec: null,
     shell: opts.shell ?? defaultShell(),
   };
 
@@ -617,6 +620,7 @@ export async function diagnose(input: string, opts: DiagnoseOptions = {}): Promi
     report.findings.push({ severity: 'info', code: 'BROWSER_UA', title: 'The server rejects non-browser clients: the command sends a browser User-Agent' });
   }
   report.downloadable = !report.findings.some((f) => f.severity === 'error' && f.code !== 'NO_AUDIO_TRACK');
-  report.command = commandFor(report, ctx, opts);
+  report.commandSpec = commandSpecFor(report, ctx, opts);
+  report.command = report.commandSpec ? buildFfmpegCommand(report.commandSpec, report.shell) : null;
   return report;
 }
