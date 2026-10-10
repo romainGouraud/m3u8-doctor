@@ -163,7 +163,7 @@ npm install && npm test
 
 ## About
 
-Maintained by the author of [Vidora](https://getvidora.com), a browser extension for saving web videos.
+Maintained by the author of [Vidora](https://getvidora.com/?utm_source=github&utm_medium=m3u8-doctor), a browser extension that saves web videos (HLS, DASH, MP4, live streams) with picture and sound. Questions about streams in general, or about Vidora, are welcome in the [Vidora community](https://github.com/romainGouraud/vidora/discussions).
 
 ## License
 
